@@ -1,0 +1,347 @@
+package com.example.tpch;
+
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.util.Collector;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.Serializable;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+//Please Attention: This .java file is just for showing output, so that existing some Chinese comments
+public class TPCH_withResultsOutput {
+    private static final String DATA_PATH = "D:/Users/Josepha/Desktop/Data1mb/";
+
+    // 实验参数
+    private static final int PARALLELISM = 4;
+    private static final int BATCH_SIZE = 500; // ❗ 修正为 500，确保 DELETE 逻辑被触发 (1500/500=3次)
+    private static final int DELETE_COUNT = 100;
+    private static final long RANDOM_SEED = 999L;
+
+    private static final int LOG_LIMIT = Integer.MAX_VALUE;
+    private static AtomicLong deleteLogCount = new AtomicLong(0);
+    private static AtomicLong insertLogCount = new AtomicLong(0);
+
+    public static final ConcurrentHashMap<String, Double> flinkResults = new ConcurrentHashMap<>();
+    private static final int SAMPLE_LIMIT_EVENT = 5; // 限制打印的插入/删除 OrderEvent 样本数
+
+    public static class OrderEvent implements Serializable {
+        public long orderKey; public String priority; public boolean isDelete;
+        public OrderEvent() {}
+        public OrderEvent(long k, String p, boolean d) { this.orderKey=k; this.priority=p; this.isDelete=d; }
+    }
+    public static class LineItem implements Serializable {
+        public long orderKey; public double extendedPrice;
+        public LineItem() {}
+        public LineItem(long k, double p) { this.orderKey=k; this.extendedPrice=p; }
+    }
+    public static class JoinedRow implements Serializable {
+        public String priority; public double price; public boolean isRetract;
+        public JoinedRow() {}
+        public JoinedRow(String p, double pr, boolean r) { this.priority=p; this.price=pr; this.isRetract=r; }
+    }
+
+
+    public static void main(String[] args) throws Exception {
+
+        System.out.println("TPC-H Experiment");
+        System.out.println("===============================================================");
+        System.out.printf("配置:并行度=%d | Batch=%d | Delete=%d | Seed=%d%n",
+                PARALLELISM, BATCH_SIZE, DELETE_COUNT, RANDOM_SEED);
+        System.out.println("\n[Phase 1] Generated Ground Truth...");
+        long startGt = System.nanoTime();
+
+        List<OrderEvent> orderEvents = generateOrderEvents(DATA_PATH + "orders.tbl", BATCH_SIZE, DELETE_COUNT, RANDOM_SEED);
+        List<LineItem> lineItems = generateLineItems(DATA_PATH + "lineitem.tbl");
+
+        Map<String, Double> groundTruth = computeGroundTruthLocal(orderEvents, lineItems);
+        long endGt = System.nanoTime();
+
+        System.out.printf("数据序列生成完成 (Order Events: %d, Line Items: %d)，耗时: %.2f ms%n",
+                orderEvents.size(), lineItems.size(), (endGt - startGt) / 1_000_000.0);
+
+        System.out.println("\n[Phase 2] 启动 Flink...");
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
+        env.setParallelism(PARALLELISM);
+
+        DataStream<OrderEvent> orderStream = env
+                .fromCollection(orderEvents)
+                .name("Source-Orders");
+
+        DataStream<LineItem> lineItemStream = env
+                .fromCollection(lineItems)
+                .name("Source-LineItem");
+
+        DataStream<JoinedRow> joinedStream = orderStream
+                .keyBy(o -> o.orderKey)
+                .connect(lineItemStream.keyBy(l -> l.orderKey))
+                .process(new CascadeJoinFunction())
+                .name("Process-Join-Cascade");
+
+        DataStream<Tuple2<String, Double>> aggResult = joinedStream
+                .keyBy(r -> r.priority)
+                .process(new AggregationFunction())
+                .name("Process-Aggregation");
+
+        aggResult.addSink(new ResultCollectingSink()).setParallelism(1);
+
+        long startFlink = System.nanoTime();
+        try {
+            env.execute("TPC-H Cascade Experiment");
+        } catch (Exception e) {
+            System.err.println("\nFlink 作业执行失败: " + e.getMessage());
+            e.printStackTrace();
+            return;
+        }
+        long endFlink = System.nanoTime();
+
+        printPerformanceReport(startFlink, endFlink, orderEvents.size());
+        verifyCorrectness(groundTruth, flinkResults);
+    }
+
+    private static List<OrderEvent> generateOrderEvents(String path, int batchSize, int deleteCount, long seed) throws Exception {
+        List<OrderEvent> events = new ArrayList<>();
+        BufferedReader br = new BufferedReader(new FileReader(path));
+        String line;
+        List<Long> currentBatchKeys = new ArrayList<>();
+        int insertSampleCount = 0;
+        int deleteTotalCount = 0;
+        Random rand = new Random(seed);
+        int totalOrderRows = 0;
+
+        System.out.println("  --- OrderEvent 序列生成日志 ---");
+
+        while ((line = br.readLine()) != null) {
+            String[] parts = line.split("\\|");
+            long orderKey = Long.parseLong(parts[0]);
+            String priority = parts[5];
+            totalOrderRows++;
+
+            // 1. INSERT 事件
+            OrderEvent insertEvent = new OrderEvent(orderKey, priority, false);
+            events.add(insertEvent);
+            currentBatchKeys.add(orderKey);
+
+            // 打印 INSERT 样本
+            if (insertSampleCount < SAMPLE_LIMIT_EVENT) {
+                System.out.printf("  [ORDER INSERT SAMPLE %d] Key: %d, Priority: %s%n", insertSampleCount + 1, orderKey, priority);
+                insertSampleCount++;
+            }
+
+            // 2. DELETE 逻辑 - 每达到一个批次，就触发删除
+            if (currentBatchKeys.size() >= batchSize) {
+                System.out.printf("  [BATCH REACHED] Triggering %d DELETEs for current %d OrderKeys.%n", deleteCount, currentBatchKeys.size());
+                for (int i = 0; i < deleteCount; i++) {
+                    if (currentBatchKeys.isEmpty()) break;
+                    int idx = rand.nextInt(currentBatchKeys.size());
+                    Long keyToDelete = currentBatchKeys.remove(idx);
+
+                    // DELETE 事件
+                    events.add(new OrderEvent(keyToDelete, null, true));
+
+                    // 打印 DELETE 样本
+                    if (deleteTotalCount < SAMPLE_LIMIT_EVENT) {
+                        System.out.printf("  [ORDER DELETE SAMPLE %d] Key: %d%n", deleteTotalCount + 1, keyToDelete);
+                    }
+                    deleteTotalCount++;
+                }
+                currentBatchKeys.clear();
+            }
+        }
+        br.close();
+
+        currentBatchKeys.clear();
+
+        System.out.println("  --- OrderEvent 序列生成结束 ---");
+        System.out.printf("\n➡️ 总 Order 行数: %d, 总 Delete 操作数: %d%n", totalOrderRows, deleteTotalCount);
+
+        return events;
+    }
+
+    private static List<LineItem> generateLineItems(String path) throws Exception {
+        List<LineItem> items = new ArrayList<>();
+        BufferedReader br = new BufferedReader(new FileReader(path));
+        String line;
+        while ((line = br.readLine()) != null) {
+            String[] parts = line.split("\\|");
+            long orderKey = Long.parseLong(parts[0]);
+            double price = Double.parseDouble(parts[5]);
+            items.add(new LineItem(orderKey, price));
+        }
+        br.close();
+        return items;
+    }
+
+    public static class CascadeJoinFunction extends KeyedCoProcessFunction<Long, OrderEvent, LineItem, JoinedRow> {
+        private transient ValueState<String> orderPriorityState;
+        private transient MapState<String, Double> lineItemsState;
+
+        @Override
+        public void open(Configuration parameters) {
+            orderPriorityState = getRuntimeContext().getState(new ValueStateDescriptor<>("priority", String.class));
+            lineItemsState = getRuntimeContext().getMapState(new MapStateDescriptor<>("lines", String.class, Double.class));
+        }
+
+        @Override
+        public void processElement1(OrderEvent order, Context ctx, Collector<JoinedRow> out) throws Exception {
+            Long currentKey = ctx.getCurrentKey();
+
+            if (!order.isDelete) {
+                // -------------------- 路径 A: INSERT / UPDATE --------------------
+                orderPriorityState.update(order.priority);
+
+                // 1. 匹配 LineItem (Order 先到，LineItem 延迟到达的情况)
+                if (lineItemsState.keys() != null) {
+                    for (Map.Entry<String, Double> entry : lineItemsState.entries()) {
+                        out.collect(new JoinedRow(order.priority, entry.getValue(), false));
+
+                        // 打印全部插入/匹配信息
+                        if (insertLogCount.getAndIncrement() < LOG_LIMIT) {
+                            System.out.printf("  [JOIN-INSERT ALL] Key: %d, Priority: %s, Price: +%.2f (Order arrived first)%n",
+                                    currentKey, order.priority, entry.getValue());
+                        }
+                    }
+                }
+            } else {
+                // -------------------- 路径 B: DELETE (级联删除) --------------------
+                String priority = orderPriorityState.value();
+                if (priority != null) {
+
+                    // 1. 触发级联撤回
+                    if (lineItemsState.keys() != null) {
+                        System.out.printf("\n>>> CASCADED DELETE TRIGGERED for OrderKey: %d, Priority: %s (Retracting %d items...)%n",
+                                currentKey, priority, lineItemsState.keys().iterator().hasNext() ? getMapSize(lineItemsState) : 0);
+
+                        for (Map.Entry<String, Double> entry : lineItemsState.entries()) {
+                            out.collect(new JoinedRow(priority, entry.getValue(), true));
+
+                            // 打印全部撤回信息
+                            if (deleteLogCount.getAndIncrement() < LOG_LIMIT) {
+                                System.out.printf("  [RETRACT ALL] Key: %d, Price: -%.2f%n",
+                                        currentKey, entry.getValue());
+                            }
+                        }
+                    }
+
+                    // 2. 原子性清除状态
+                    orderPriorityState.clear();
+                    lineItemsState.clear();
+                }
+            }
+        }
+
+        @Override
+        public void processElement2(LineItem item, Context ctx, Collector<JoinedRow> out) throws Exception {
+            Long currentKey = ctx.getCurrentKey();
+
+            // 1. 存储 LineItem
+            lineItemsState.put(UUID.randomUUID().toString(), item.extendedPrice);
+
+            String priority = orderPriorityState.value();
+
+            // 2. 匹配 Order (LineItem 先到，Order 已经到达的情况)
+            if (priority != null) {
+                out.collect(new JoinedRow(priority, item.extendedPrice, false));
+
+                // 打印全部插入/匹配信息
+                if (insertLogCount.getAndIncrement() < LOG_LIMIT) {
+                    System.out.printf("  [JOIN-INSERT ALL] Key: %d, Priority: %s, Price: +%.2f%n",
+                            currentKey, priority, item.extendedPrice);
+                }
+            }
+        }
+
+        // Helper function to get map size (best effort for logging)
+        private int getMapSize(MapState<?, ?> mapState) throws Exception {
+            int size = 0;
+            Iterator<?> iterator = mapState.keys().iterator();
+            while (iterator.hasNext()) {
+                iterator.next();
+                size++;
+            }
+            return size;
+        }
+    }
+
+
+    public static class AggregationFunction extends org.apache.flink.streaming.api.functions.KeyedProcessFunction<String, JoinedRow, Tuple2<String, Double>> {
+        private transient ValueState<Double> sumState;
+        // ... open and processElement methods ...
+        @Override public void open(Configuration parameters) { sumState = getRuntimeContext().getState(new ValueStateDescriptor<>("sum", Double.class)); }
+        @Override public void processElement(JoinedRow row, Context ctx, Collector<Tuple2<String, Double>> out) throws Exception {
+            Double currentSum = sumState.value();
+            if (currentSum == null) currentSum = 0.0;
+            currentSum += row.isRetract ? -row.price : row.price;
+            sumState.update(currentSum);
+            out.collect(Tuple2.of(ctx.getCurrentKey(), currentSum));
+        }
+    }
+
+    public static class ResultCollectingSink implements SinkFunction<Tuple2<String, Double>> {
+        // ... invoke method ...
+        @Override public void invoke(Tuple2<String, Double> value, Context context) { flinkResults.put(value.f0, value.f1); }
+    }
+
+    private static Map<String, Double> computeGroundTruthLocal(List<OrderEvent> orderEvents, List<LineItem> lineItems) {
+        // ... implementation ...
+        Map<Long, String> finalOrders = new HashMap<>();
+        Map<Long, List<Double>> initialLineItems = new HashMap<>();
+
+        for (LineItem item : lineItems) { initialLineItems.computeIfAbsent(item.orderKey, k -> new ArrayList<>()).add(item.extendedPrice); }
+        for (OrderEvent event : orderEvents) { if (!event.isDelete) { finalOrders.put(event.orderKey, event.priority); } else { finalOrders.remove(event.orderKey); } }
+
+        Map<String, Double> result = new HashMap<>();
+        for (Map.Entry<Long, String> entry : finalOrders.entrySet()) {
+            Long orderKey = entry.getKey();
+            String priority = entry.getValue();
+            if (initialLineItems.containsKey(orderKey)) {
+                for (Double price : initialLineItems.get(orderKey)) { result.put(priority, result.getOrDefault(priority, 0.0) + price); }
+            }
+        }
+        return result;
+    }
+
+    private static void printPerformanceReport(long startNano, long endNano, int totalOps) {
+        double durationSeconds = (endNano - startNano) / 1_000_000_000.0;
+        System.out.println("\nPerformance Report");
+        //最终版记得改成英文
+        System.out.printf("总耗时     : %.2f 秒%n", durationSeconds);
+        System.out.printf("总事件数 : %d 条%n", totalOps);
+        System.out.printf("平均吞吐量 : %.2f Ops/sec%n", totalOps / durationSeconds);
+        System.out.println("=======================");
+    }
+
+    private static void verifyCorrectness(Map<String, Double> expected, Map<String, Double> actual) {
+        // ... implementation ...
+        System.out.println("\nCorrectness Check");
+        boolean allMatch = true;
+        List<String> keys = new ArrayList<>(expected.keySet());
+        Collections.sort(keys);
+        System.out.printf("%-20s | %-15s | %-15s | %-10s%n", "Priority", "Expected", "Flink Actual", "Status");
+        System.out.println("----------------------------------------------------------------------");
+        for (String key : keys) {
+            double expVal = expected.get(key);
+            double actVal = actual.getOrDefault(key, 0.0);
+            double diff = Math.abs(expVal - actVal);
+            boolean match = diff < 0.01;
+            if (!match) allMatch = false;
+            System.out.printf("%-20s | %-15.2f | %-15.2f | %s%n", key, expVal, actVal, match ? "✅ PASS" : "❌ FAIL");
+        }
+        System.out.println("----------------------------------------------------------------------");
+        if (allMatch) { System.out.println("最终结果: SUCCESS (Flink 计算结果与 Java 基准完全一致)"); }
+        else { System.err.println("最终结果: FAILURE (检测到数值不匹配)"); }
+    }
+}
