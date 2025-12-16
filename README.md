@@ -1,5 +1,8 @@
 # UST_IndividualProject_Code
 Created by CHEN Haitong(21245275)
+
+Based on **Flink 17.2.2** and **Java 1.8**
+
 The code for this project is located in the "Test3" folder. The main structure of the document is shown in the figure below.
 
 <img width="474" height="647" alt="image" src="https://github.com/user-attachments/assets/0eadf79f-c185-4cc9-9c61-137da338c3ab" />
